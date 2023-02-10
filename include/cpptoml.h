@@ -3109,7 +3109,7 @@ class parser
                 parse_key_value(it, end, tbl.get());
                 consume_whitespace(it, end);
             }
-        } while (*it == ',');
+        } while (it != end && *it == ',');
 
         if (it == end || *it != '}')
             throw_parse_exception("Unterminated inline table");
