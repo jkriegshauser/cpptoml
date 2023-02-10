@@ -2739,8 +2739,6 @@ class parser
                      && check_it[2] == 'n')
             {
                 auto val = std::numeric_limits<double>::quiet_NaN();
-                if (*it == '-')
-                    val = -val;
                 it = check_it + 3;
                 return make_value(val);
             }
