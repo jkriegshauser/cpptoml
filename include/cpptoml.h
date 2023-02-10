@@ -1869,182 +1869,57 @@ inline std::istream& getline(std::istream& input, std::string& line)
 }
 } // namespace detail
 
-/**
- * The parser class.
- */
-class parser
+using key_array = std::vector<std::string>;
+using key_iterator = std::vector<std::string>::const_iterator;
+
+namespace detail
+{
+
+class dom_handler
 {
   public:
-    /**
-     * Parsers are constructed from streams.
-     */
-    parser(std::istream& stream) : input_(stream)
+    std::shared_ptr<table> get_root()
     {
-        // nothing
-    }
-
-    parser& operator=(const parser& parser) = delete;
-
-    /**
-     * Parses the stream this parser was created on until EOF.
-     * @throw parse_exception if there are errors in parsing
-     */
-    std::shared_ptr<table> parse()
-    {
-        std::shared_ptr<table> root = make_table();
-
-        table* curr_table = root.get();
-
-        while (detail::getline(input_, line_))
-        {
-            line_number_++;
-            auto it = line_.begin();
-            auto end = line_.end();
-            consume_whitespace(it, end);
-            if (it == end || *it == '#')
-                continue;
-            if (*it == '[')
-            {
-                curr_table = root.get();
-                parse_table(it, end, curr_table);
-            }
-            else
-            {
-                parse_key_value(it, end, curr_table);
-                consume_whitespace(it, end);
-                eol_or_comment(it, end);
-            }
-        }
         return root;
     }
 
-  private:
-#if defined _MSC_VER
-    __declspec(noreturn)
-#elif defined __GNUC__
-    __attribute__((noreturn))
-#endif
-        void throw_parse_exception(const std::string& err)
+    void begin_document()
     {
-        throw parse_exception{err, line_number_};
+        root = make_table();
+        return_to_root();
     }
 
-    void parse_table(std::string::iterator& it,
-                     const std::string::iterator& end, table*& curr_table)
+    void end_document()
     {
-        // remove the beginning keytable marker
-        ++it;
-        if (it == end)
-            throw_parse_exception("Unexpected end of table");
-        if (*it == '[')
-            parse_table_array(it, end, curr_table);
-        else
-            parse_single_table(it, end, curr_table);
+        // Nothing
     }
 
-    void parse_single_table(std::string::iterator& it,
-                            const std::string::iterator& end,
-                            table*& curr_table)
+    void top_level_table(key_iterator begin, key_iterator end)
     {
-        if (it == end || *it == ']')
-            throw_parse_exception("Table name cannot be empty");
-
-        std::string full_table_name;
-        bool inserted = false;
-
-        auto key_end = [](char c) { return c == ']'; };
-
-        auto key_part_handler = [&](const std::string& part) {
-            if (part.empty())
-                throw_parse_exception("Empty component of table name");
-
-            if (!full_table_name.empty())
-                full_table_name += '.';
-            full_table_name += part;
-
-            if (curr_table->contains(part))
-            {
-#if !defined(__PGI)
-                auto b = curr_table->get(part);
-#else
-                // Workaround for PGI compiler
-                std::shared_ptr<base> b = curr_table->get(part);
-#endif
-                if (b->is_table())
-                    curr_table = static_cast<table*>(b.get());
-                else if (b->is_table_array())
-                    curr_table = std::static_pointer_cast<table_array>(b)
-                                     ->get()
-                                     .back()
-                                     .get();
-                else
-                    throw_parse_exception("Key " + full_table_name
-                                          + "already exists as a value");
-            }
-            else
-            {
-                inserted = true;
-                curr_table->insert(part, make_table());
-                curr_table = static_cast<table*>(curr_table->get(part).get());
-            }
-        };
-
-        key_part_handler(parse_key(it, end, key_end, key_part_handler));
-
-        if (it == end)
-            throw_parse_exception(
-                "Unterminated table declaration; did you forget a ']'?");
-
-        if (*it != ']')
-        {
-            std::string errmsg{"Unexpected character in table definition: "};
-            errmsg += '"';
-            errmsg += *it;
-            errmsg += '"';
-            throw_parse_exception(errmsg);
-        }
-
-        // table already existed
-        if (!inserted)
-        {
-            auto is_value
-                = [](const std::pair<const std::string&,
-                                     const std::shared_ptr<base>&>& p) {
-                      return p.second->is_value();
-                  };
-
-            // if there are any values, we can't add values to this table
-            // since it has already been defined. If there aren't any
-            // values, then it was implicitly created by something like
-            // [a.b]
-            if (curr_table->empty()
-                || std::any_of(curr_table->begin(), curr_table->end(),
-                               is_value))
-            {
-                throw_parse_exception("Redefinition of table "
-                                      + full_table_name);
-            }
-        }
-
-        ++it;
-        consume_whitespace(it, end);
-        eol_or_comment(it, end);
+        return_to_root();
+        push_table_internal(begin, end, true);
     }
 
-    void parse_table_array(std::string::iterator& it,
-                           const std::string::iterator& end, table*& curr_table)
+    void push_table(key_iterator begin, key_iterator end)
     {
-        ++it;
-        if (it == end || *it == ']')
-            throw_parse_exception("Table array name cannot be empty");
+        push_table_internal(begin, end, false);
+    }
 
-        auto key_end = [](char c) { return c == ']'; };
+    void pop_table(key_iterator begin, key_iterator end)
+    {
+        assert(object_stack.size() > 1);
+        assert(object_stack.back()->is_table());
+        object_stack.pop_back();
+    }
 
+    void top_level_table_array(key_iterator begin, key_iterator end)
+    {
+        auto curr_table = return_to_root();
         std::string full_ta_name;
-        auto key_part_handler = [&](const std::string& part) {
-            if (part.empty())
-                throw_parse_exception("Empty component of table array name");
 
+        for (auto it = begin; it != end; ++it)
+        {
+            const auto& part = *it;
             if (!full_ta_name.empty())
                 full_ta_name += '.';
             full_ta_name += part;
@@ -2061,11 +1936,11 @@ class parser
                 // if this is the end of the table array name, add an
                 // element to the table array that we just looked up,
                 // provided it was not declared inline
-                if (it != end && *it == ']')
+                if ((it + 1) == end)
                 {
                     if (!b->is_table_array())
                     {
-                        throw_parse_exception("Key " + full_ta_name
+                        throw parse_exception("Key " + full_ta_name
                                               + " is not a table array");
                     }
 
@@ -2073,7 +1948,7 @@ class parser
 
                     if (v->is_inline())
                     {
-                        throw_parse_exception("Static array " + full_ta_name
+                        throw parse_exception("Static array " + full_ta_name
                                               + " cannot be appended to");
                     }
 
@@ -2091,7 +1966,7 @@ class parser
                                          .back()
                                          .get();
                     else
-                        throw_parse_exception("Key " + full_ta_name
+                        throw parse_exception("Key " + full_ta_name
                                               + " already exists as a value");
                 }
             }
@@ -2100,11 +1975,10 @@ class parser
                 // if this is the end of the table array name, add a new
                 // table array and a new table inside that array for us to
                 // add keys to next
-                if (it != end && *it == ']')
+                if ((it + 1) == end)
                 {
-                    curr_table->insert(part, make_table_array());
-                    auto arr = std::static_pointer_cast<table_array>(
-                        curr_table->get(part));
+                    auto arr = make_table_array();
+                    curr_table->insert(part, arr);
                     arr->get().push_back(make_table());
                     curr_table = arr->get().back().get();
                 }
@@ -2112,11 +1986,362 @@ class parser
                 // down to it
                 else
                 {
-                    curr_table->insert(part, make_table());
-                    curr_table
-                        = static_cast<table*>(curr_table->get(part).get());
+                    auto p = make_table();
+                    curr_table->insert(part, p);
+                    curr_table = p.get();
                 }
             }
+        }
+        assert(object_stack.back() != curr_table);
+        object_stack.push_back(curr_table);
+    }
+
+    void begin_inline_table()
+    {
+        auto tbl = make_table();
+        assert(object_stack.back()->is_table_array() || object_stack.back()->is_table());
+        if (auto a = object_stack.back()->as_table_array())
+            a->push_back(tbl);
+        else if (auto t = object_stack.back()->as_table())
+            t->insert(key_, tbl);
+        object_stack.push_back(tbl.get());
+    }
+
+    void end_inline_table()
+    {
+        assert(object_stack.back()->is_table());
+        object_stack.pop_back();
+    }
+
+    void begin_array(bool table_array)
+    {
+        if (table_array)
+        {
+            auto ta = make_table_array(true);
+            assert(object_stack.back()->is_table());
+            object_stack.back()->as_table()->insert(key_, ta);
+            object_stack.push_back(ta.get());
+        }
+        else
+        {
+            auto arr = make_array();
+            assert(object_stack.back()->is_array() || object_stack.back()->is_table());
+            if (auto a = object_stack.back()->as_array())
+                array_exception_guard([&] { a->push_back(arr); });
+            else if (auto t = object_stack.back()->as_table())
+                t->insert(key_, arr);
+            object_stack.push_back(arr.get());
+        }
+    }
+
+    void end_array()
+    {
+        assert(object_stack.back()->is_array() || object_stack.back()->is_table_array());
+        object_stack.pop_back();
+    }
+
+    void key(const std::string& key)
+    {
+        assert(object_stack.back()->is_table());
+        if (object_stack.back()->as_table()->contains(key))
+            throw parse_exception("Key " + key + " already present");
+        
+        key_ = key;
+    }
+
+    void value_string(std::string val)
+    {
+        add_value(std::move(val));
+    }
+
+    void value_integer(int64_t val)
+    {
+        add_value(val);
+    }
+
+    void value_float(double val)
+    {
+        add_value(val);
+    }
+
+    void value_bool(bool val)
+    {
+        add_value(val);
+    }
+
+    void value_local_time(local_time val)
+    {
+        add_value(val);
+    }
+
+    void value_local_date(local_date val)
+    {
+        add_value(val);
+    }
+
+    void value_local_datetime(local_datetime val)
+    {
+        add_value(val);
+    }
+
+    void value_offset_datetime(offset_datetime val)
+    {
+        add_value(val);
+    }
+
+  private:
+
+    void push_table_internal(key_iterator begin, key_iterator end, bool toplevel)
+    {
+        std::string full_table_name;
+        bool inserted = false;
+
+        auto curr_table = object_stack.back()->as_table().get();
+
+        for (auto it = begin; it != end; ++it)
+        {
+            if (!full_table_name.empty())
+                full_table_name.push_back('.');
+            full_table_name += *it;
+            if (curr_table->contains(*it))
+            {
+#if !defined(__PGI)
+                auto b = curr_table->get(*it);
+#else
+                // Workaround for PGI compiler
+                std::shared_ptr<base> b = curr_table->get(*it);
+#endif
+                if (b->is_table())
+                    curr_table = static_cast<table*>(b.get());
+                else if (b->is_table_array() && toplevel)
+                    curr_table = std::static_pointer_cast<table_array>(b)
+                                    ->get()
+                                    .back()
+                                    .get();
+                else
+                    throw parse_exception("Key " + full_table_name + " already exists as a value");
+            }
+            else
+            {
+                inserted = true;
+                auto p = make_table();
+                curr_table->insert(*it, p);
+                curr_table = p.get();
+            }
+        }
+
+        // table already existed
+        if (!inserted && toplevel)
+        {
+            auto is_value
+                = [](const std::pair<const std::string&,
+                                     const std::shared_ptr<base>&>& p) {
+                    return p.second->is_value();
+                };
+
+            // if there are any values, we can't add values to this table
+            // since it has already been defined. If there aren't any
+            // values, then it was implicitly created by something like
+            // [a.b]
+            if (curr_table->empty()
+                || std::any_of(curr_table->begin(), curr_table->end(),
+                               is_value))
+            {
+                throw parse_exception("Redefinition of table "
+                                      + full_table_name);
+            }
+        }
+
+        assert(object_stack.back() != curr_table);
+        object_stack.push_back(curr_table);
+    }
+
+    template <class Func>
+    void array_exception_guard(Func&& func)
+    {
+        try
+        {
+            func();
+        }
+        catch (const array_exception& ae)
+        {
+            // rethrow array_exception as parse_exception
+            throw parse_exception(ae.what());
+        }
+    }
+
+    template <class T>
+    void add_value(T&& val)
+    {
+        if (auto a = object_stack.back()->as_array())
+            array_exception_guard([&] { a->push_back(make_value(std::forward<T>(val))); });
+        else
+            object_stack.back()->as_table()->insert(key_, make_value(std::forward<T>(val)));
+    }
+
+    table* return_to_root()
+    {
+        object_stack.clear();
+        object_stack.push_back(root.get());
+        return root.get();
+    }
+
+    std::shared_ptr<table> root;
+    std::string key_;
+    std::vector<base*> object_stack;
+};
+
+}
+
+/**
+ * The parser class.
+ */
+template<class HandlerType>
+class parser_sax
+{
+  public:
+    using Handler = typename std::decay<HandlerType>::type;
+
+    /**
+     * Parsers are constructed from streams.
+     */
+    parser_sax(std::istream& stream) : input_(stream)
+    {
+        // nothing
+    }
+
+    parser_sax& operator=(const parser_sax& parser) = delete;
+
+    /**
+     * Parses the stream this parser was created on until EOF.
+     * @throw parse_exception if there are errors in parsing
+     */
+    void parse(Handler& handler)
+    {
+        handler_ = &handler;
+        line_.clear();
+        line_number_ = 0;
+        call_handler(&Handler::begin_document);
+
+        while (detail::getline(input_, line_))
+        {
+            line_number_++;
+            auto it = line_.begin();
+            auto end = line_.end();
+            consume_whitespace(it, end);
+            if (it == end || *it == '#')
+                continue;
+            if (*it == '[')
+            {
+                parse_table(it, end);
+            }
+            else
+            {
+                parse_key_value(it, end);
+                consume_whitespace(it, end);
+                eol_or_comment(it, end);
+            }
+        }
+
+        call_handler(&Handler::end_document);
+        handler_ = nullptr;
+    }
+
+  private:
+    template<class Func, class... Args>
+    void call_handler(Func&& func, Args&&... args)
+    {
+        try
+        {
+            (handler_->*func)(std::forward<Args>(args)...);
+        }
+        catch (const parse_exception& p)
+        {
+            // Rethrow with current line number
+            if (line_number_ != 0)
+                throw parse_exception{p.what(), line_number_};
+            else
+                throw;
+        }
+    }
+
+#if defined _MSC_VER
+    __declspec(noreturn)
+#elif defined __GNUC__
+    __attribute__((noreturn))
+#endif
+        void throw_parse_exception(const std::string& err)
+    {
+        throw parse_exception{err, line_number_};
+    }
+
+    void parse_table(std::string::iterator& it,
+                     const std::string::iterator& end)
+    {
+        // remove the beginning keytable marker
+        ++it;
+        if (it == end)
+            throw_parse_exception("Unexpected end of table");
+        if (*it == '[')
+            parse_table_array(it, end);
+        else
+            parse_single_table(it, end);
+    }
+
+    void parse_single_table(std::string::iterator& it,
+                            const std::string::iterator& end)
+    {
+        if (it == end || *it == ']')
+            throw_parse_exception("Table name cannot be empty");
+
+        key_array full_table_name;
+
+        auto key_end = [](char c) { return c == ']'; };
+
+        auto key_part_handler = [&](const std::string& part) {
+            if (part.empty())
+                throw_parse_exception("Empty component of table name");
+
+            full_table_name.push_back(part);
+        };
+
+        key_part_handler(parse_key(it, end, key_end, key_part_handler));
+
+        if (it == end)
+            throw_parse_exception(
+                "Unterminated table declaration; did you forget a ']'?");
+
+        if (*it != ']')
+        {
+            std::string errmsg{"Unexpected character in table definition: "};
+            errmsg += '"';
+            errmsg += *it;
+            errmsg += '"';
+            throw_parse_exception(errmsg);
+        }
+
+        call_handler(&Handler::top_level_table, full_table_name.begin(), full_table_name.end());
+
+        ++it;
+        consume_whitespace(it, end);
+        eol_or_comment(it, end);
+    }
+
+    void parse_table_array(std::string::iterator& it,
+                           const std::string::iterator& end)
+    {
+        ++it;
+        if (it == end || *it == ']')
+            throw_parse_exception("Table array name cannot be empty");
+
+        auto key_end = [](char c) { return c == ']'; };
+
+        key_array full_ta_name;
+        auto key_part_handler = [&](const std::string& part) {
+            if (part.empty())
+                throw_parse_exception("Empty component of table array name");
+
+            full_ta_name.push_back(part);
         };
 
         key_part_handler(parse_key(it, end, key_end, key_part_handler));
@@ -2128,50 +2353,39 @@ class parser
         eat(']');
         eat(']');
 
+        call_handler(&Handler::top_level_table_array, full_ta_name.begin(), full_ta_name.end());
+
         consume_whitespace(it, end);
         eol_or_comment(it, end);
     }
 
-    void parse_key_value(std::string::iterator& it, std::string::iterator& end,
-                         table* curr_table)
+    void parse_key_value(std::string::iterator& it, std::string::iterator& end)
     {
         auto key_end = [](char c) { return c == '='; };
 
+        key_array keys;
+
         auto key_part_handler = [&](const std::string& part) {
-            // two cases: this key part exists already, in which case it must
-            // be a table, or it doesn't exist in which case we must create
-            // an implicitly defined table
-            if (curr_table->contains(part))
-            {
-                auto val = curr_table->get(part);
-                if (val->is_table())
-                {
-                    curr_table = static_cast<table*>(val.get());
-                }
-                else
-                {
-                    throw_parse_exception("Key " + part
-                                          + " already exists as a value");
-                }
-            }
-            else
-            {
-                auto newtable = make_table();
-                curr_table->insert(part, newtable);
-                curr_table = newtable.get();
-            }
+            keys.push_back(part);
         };
 
         auto key = parse_key(it, end, key_end, key_part_handler);
 
-        if (curr_table->contains(key))
-            throw_parse_exception("Key " + key + " already present");
+        if (!keys.empty())
+            call_handler(&Handler::push_table, keys.begin(), keys.end());
+
+        call_handler(&Handler::key, key);
+
         if (it == end || *it != '=')
             throw_parse_exception("Value must follow after a '='");
+
         ++it;
         consume_whitespace(it, end);
-        curr_table->insert(key, parse_value(it, end));
+        parse_value(it, end);
         consume_whitespace(it, end);
+
+        if (!keys.empty())
+            call_handler(&Handler::pop_table, keys.begin(), keys.end());
     }
 
     template <class KeyEndFinder, class KeyPartHandler>
@@ -2282,32 +2496,40 @@ class parser
         INLINE_TABLE
     };
 
-    std::shared_ptr<base> parse_value(std::string::iterator& it,
+    parse_type parse_value(std::string::iterator& it,
                                       std::string::iterator& end)
     {
         parse_type type = determine_value_type(it, end);
         switch (type)
         {
             case parse_type::STRING:
-                return parse_string(it, end);
+                parse_string(it, end);
+                break;
             case parse_type::LOCAL_TIME:
-                return parse_time(it, end);
+                parse_time(it, end);
+                break;
             case parse_type::LOCAL_DATE:
             case parse_type::LOCAL_DATETIME:
             case parse_type::OFFSET_DATETIME:
-                return parse_date(it, end);
+                parse_date(it, end);
+                break;
             case parse_type::INT:
             case parse_type::FLOAT:
-                return parse_number(it, end);
+                parse_number(it, end);
+                break;
             case parse_type::BOOL:
-                return parse_bool(it, end);
+                parse_bool(it, end);
+                break;
             case parse_type::ARRAY:
-                return parse_array(it, end);
+                parse_array(it, end);
+                break;
             case parse_type::INLINE_TABLE:
-                return parse_inline_table(it, end);
+                parse_inline_table(it, end);
+                break;
             default:
                 throw_parse_exception("Failed to parse value");
         }
+        return type;
     }
 
     parse_type determine_value_type(const std::string::iterator& it,
@@ -2381,8 +2603,7 @@ class parser
         }
     }
 
-    std::shared_ptr<value<std::string>> parse_string(std::string::iterator& it,
-                                                     std::string::iterator& end)
+    void parse_string(std::string::iterator& it, std::string::iterator& end)
     {
         auto delim = *it;
         assert(delim == '"' || delim == '\'');
@@ -2397,13 +2618,14 @@ class parser
             if (check_it != end && *check_it == delim)
             {
                 it = ++check_it;
-                return parse_multiline_string(it, end, delim);
+                call_handler(&Handler::value_string, parse_multiline_string(it, end, delim));
+                return;
             }
         }
-        return make_value<std::string>(string_literal(it, end, delim));
+        call_handler(&Handler::value_string, string_literal(it, end, delim));
     }
 
-    std::shared_ptr<value<std::string>>
+    std::string
     parse_multiline_string(std::string::iterator& it,
                            std::string::iterator& end, char delim)
     {
@@ -2412,7 +2634,7 @@ class parser
         auto is_ws = [](char c) { return c == ' ' || c == '\t'; };
 
         bool consuming = false;
-        std::shared_ptr<value<std::string>> ret;
+        bool done = false;
 
         auto handle_line = [&](std::string::iterator& local_it,
                                std::string::iterator& local_end) {
@@ -2456,7 +2678,7 @@ class parser
                         && *check++ == delim)
                     {
                         local_it = check;
-                        ret = make_value<std::string>(ss.str());
+                        done = true;
                         break;
                     }
                 }
@@ -2467,8 +2689,8 @@ class parser
 
         // handle the remainder of the current line
         handle_line(it, end);
-        if (ret)
-            return ret;
+        if (done)
+            return ss.str();
 
         // start eating lines
         while (detail::getline(input_, line_))
@@ -2480,8 +2702,8 @@ class parser
 
             handle_line(it, end);
 
-            if (ret)
-                return ret;
+            if (done)
+                return ss.str();
 
             if (!consuming)
                 ss << std::endl;
@@ -2653,8 +2875,7 @@ class parser
                                        - ((c >= 'a' && c <= 'f') ? 'a' : 'A'));
     }
 
-    std::shared_ptr<base> parse_number(std::string::iterator& it,
-                                       const std::string::iterator& end)
+    void parse_number(std::string::iterator& it, const std::string::iterator& end)
     {
         auto check_it = it;
         auto check_end = find_end_of_number(it, end);
@@ -2702,23 +2923,24 @@ class parser
             if (base == 'x')
             {
                 eat_hex();
-                return parse_int(it, check_it, 16);
+                parse_int(it, check_it, 16);
+                return;
             }
             else if (base == 'o')
             {
                 auto start = check_it;
                 eat_numbers();
-                auto val = parse_int(start, check_it, 8, "0");
+                parse_int(start, check_it, 8, "0");
                 it = start;
-                return val;
+                return;
             }
             else // if (base == 'b')
             {
                 auto start = check_it;
                 eat_numbers();
-                auto val = parse_int(start, check_it, 2);
+                parse_int(start, check_it, 2);
                 it = start;
-                return val;
+                return;
             }
         }
 
@@ -2733,14 +2955,16 @@ class parser
                 if (*it == '-')
                     val = -val;
                 it = check_it + 3;
-                return make_value(val);
+                call_handler(&Handler::value_float, val);
+                return;
             }
             else if (check_it[0] == 'n' && check_it[1] == 'a'
                      && check_it[2] == 'n')
             {
                 auto val = std::numeric_limits<double>::quiet_NaN();
                 it = check_it + 3;
-                return make_value(val);
+                call_handler(&Handler::value_float, val);
+                return;
             }
         }
 
@@ -2773,18 +2997,18 @@ class parser
                 eat_exp();
             }
 
-            return parse_float(it, check_it);
+            parse_float(it, check_it);
         }
         else
         {
-            return parse_int(it, check_it);
+            parse_int(it, check_it);
         }
     }
 
-    std::shared_ptr<value<int64_t>> parse_int(std::string::iterator& it,
-                                              const std::string::iterator& end,
-                                              int base = 10,
-                                              const char* prefix = "")
+    void parse_int(std::string::iterator& it,
+                   const std::string::iterator& end,
+                   int base = 10,
+                   const char* prefix = "")
     {
         std::string v{it, end};
         v = prefix + v;
@@ -2792,7 +3016,7 @@ class parser
         it = end;
         try
         {
-            return make_value<int64_t>(std::stoll(v, nullptr, base));
+            call_handler(&Handler::value_integer, std::stoll(v, nullptr, base));
         }
         catch (const std::invalid_argument& ex)
         {
@@ -2806,8 +3030,7 @@ class parser
         }
     }
 
-    std::shared_ptr<value<double>> parse_float(std::string::iterator& it,
-                                               const std::string::iterator& end)
+    void parse_float(std::string::iterator& it, const std::string::iterator& end)
     {
         std::string v{it, end};
         v.erase(std::remove(v.begin(), v.end(), '_'), v.end());
@@ -2816,7 +3039,7 @@ class parser
         std::replace(v.begin(), v.end(), '.', decimal_point);
         try
         {
-            return make_value<double>(std::stod(v));
+            call_handler(&Handler::value_float, std::stod(v));
         }
         catch (const std::invalid_argument& ex)
         {
@@ -2830,8 +3053,7 @@ class parser
         }
     }
 
-    std::shared_ptr<value<bool>> parse_bool(std::string::iterator& it,
-                                            const std::string::iterator& end)
+    void parse_bool(std::string::iterator& it, const std::string::iterator& end)
     {
         auto eat = make_consumer(it, end, [this]() {
             throw_parse_exception("Attempted to parse invalid boolean value");
@@ -2840,16 +3062,17 @@ class parser
         if (*it == 't')
         {
             eat("true");
-            return make_value<bool>(true);
+            call_handler(&Handler::value_bool, true);
+            return;
         }
         else if (*it == 'f')
         {
             eat("false");
-            return make_value<bool>(false);
+            call_handler(&Handler::value_bool, false);
+            return;
         }
 
         eat.error();
-        return nullptr;
     }
 
     std::string::iterator find_end_of_number(std::string::iterator it,
@@ -2926,14 +3149,12 @@ class parser
         return ltime;
     }
 
-    std::shared_ptr<value<local_time>>
-    parse_time(std::string::iterator& it, const std::string::iterator& end)
+    void parse_time(std::string::iterator& it, const std::string::iterator& end)
     {
-        return make_value(read_time(it, end));
+        call_handler(&Handler::value_local_time, read_time(it, end));
     }
 
-    std::shared_ptr<base> parse_date(std::string::iterator& it,
-                                     const std::string::iterator& end)
+    void parse_date(std::string::iterator& it, const std::string::iterator& end)
     {
         auto date_end = find_end_of_date(it, end);
 
@@ -2948,7 +3169,10 @@ class parser
         ldate.day = eat.eat_digits(2);
 
         if (it == date_end)
-            return make_value(ldate);
+        {
+            call_handler(&Handler::value_local_date, ldate);
+            return;
+        }
 
         eat.eat_or('T', ' ');
 
@@ -2957,7 +3181,10 @@ class parser
         static_cast<local_time&>(ldt) = read_time(it, date_end);
 
         if (it == date_end)
-            return make_value(ldt);
+        {
+            call_handler(&Handler::value_local_datetime, ldt);
+            return;
+        }
 
         offset_datetime dt;
         static_cast<local_datetime&>(dt) = ldt;
@@ -2983,11 +3210,10 @@ class parser
         if (it != date_end)
             throw_parse_exception("Malformed date");
 
-        return make_value(dt);
+        call_handler(&Handler::value_offset_datetime, dt);
     }
 
-    std::shared_ptr<base> parse_array(std::string::iterator& it,
-                                      std::string::iterator& end)
+    void parse_array(std::string::iterator& it, std::string::iterator& end)
     {
         // this gets ugly because of the "homogeneity" restriction:
         // arrays can either be of only one type, or contain arrays
@@ -3004,52 +3230,46 @@ class parser
         if (*it == ']')
         {
             ++it;
-            return make_array();
+            call_handler(&Handler::begin_array, false);
+            call_handler(&Handler::end_array);
+            return;
         }
 
         auto val_end = std::find_if(
             it, end, [](char c) { return c == ',' || c == ']' || c == '#'; });
         parse_type type = determine_value_type(it, val_end);
+        call_handler(&Handler::begin_array, type == parse_type::INLINE_TABLE);
         switch (type)
         {
             case parse_type::STRING:
-                return parse_value_array<std::string>(it, end);
             case parse_type::LOCAL_TIME:
-                return parse_value_array<local_time>(it, end);
             case parse_type::LOCAL_DATE:
-                return parse_value_array<local_date>(it, end);
             case parse_type::LOCAL_DATETIME:
-                return parse_value_array<local_datetime>(it, end);
             case parse_type::OFFSET_DATETIME:
-                return parse_value_array<offset_datetime>(it, end);
             case parse_type::INT:
-                return parse_value_array<int64_t>(it, end);
             case parse_type::FLOAT:
-                return parse_value_array<double>(it, end);
             case parse_type::BOOL:
-                return parse_value_array<bool>(it, end);
+                parse_value_array(it, end, type);
+                break;
             case parse_type::ARRAY:
-                return parse_object_array<array>(&parser::parse_array, '[', it,
-                                                 end);
+                parse_object_array(&parser_sax::parse_array, '[', it, end);
+                break;
             case parse_type::INLINE_TABLE:
-                return parse_object_array<table_array>(
-                    &parser::parse_inline_table, '{', it, end);
+                parse_object_array(&parser_sax::parse_inline_table, '{', it, end);
+                break;
             default:
                 throw_parse_exception("Unable to parse array");
         }
+
+        call_handler(&Handler::end_array);
     }
 
-    template <class Value>
-    std::shared_ptr<array> parse_value_array(std::string::iterator& it,
-                                             std::string::iterator& end)
+    void parse_value_array(std::string::iterator& it, std::string::iterator& end, parse_type type)
     {
-        auto arr = make_array();
         while (it != end && *it != ']')
         {
-            auto val = parse_value(it, end);
-            if (auto v = val->as<Value>())
-                arr->get().push_back(val);
-            else
+            auto val_type = parse_value(it, end);
+            if (val_type != type)
                 throw_parse_exception("Arrays must be homogeneous");
             skip_whitespace_and_comments(it, end);
             if (*it != ',')
@@ -3059,22 +3279,19 @@ class parser
         }
         if (it != end)
             ++it;
-        return arr;
     }
 
-    template <class Object, class Function>
-    std::shared_ptr<Object> parse_object_array(Function&& fun, char delim,
-                                               std::string::iterator& it,
-                                               std::string::iterator& end)
+    template <class Function>
+    void parse_object_array(Function&& fun, char delim,
+                            std::string::iterator& it,
+                            std::string::iterator& end)
     {
-        auto arr = detail::make_element<Object>();
-
         while (it != end && *it != ']')
         {
             if (*it != delim)
                 throw_parse_exception("Unexpected character in array");
 
-            arr->get().push_back(((*this).*fun)(it, end));
+            (this->*fun)(it, end);
             skip_whitespace_and_comments(it, end);
 
             if (it == end || *it != ',')
@@ -3088,13 +3305,12 @@ class parser
             throw_parse_exception("Unterminated array");
 
         ++it;
-        return arr;
     }
 
-    std::shared_ptr<table> parse_inline_table(std::string::iterator& it,
-                                              std::string::iterator& end)
+    void parse_inline_table(std::string::iterator& it, std::string::iterator& end)
     {
-        auto tbl = make_table();
+        call_handler(&Handler::begin_inline_table);
+
         do
         {
             ++it;
@@ -3104,7 +3320,7 @@ class parser
             consume_whitespace(it, end);
             if (it != end && *it != '}')
             {
-                parse_key_value(it, end, tbl.get());
+                parse_key_value(it, end);
                 consume_whitespace(it, end);
             }
         } while (it != end && *it == ',');
@@ -3115,7 +3331,7 @@ class parser
         ++it;
         consume_whitespace(it, end);
 
-        return tbl;
+        call_handler(&Handler::end_inline_table);
     }
 
     void skip_whitespace_and_comments(std::string::iterator& start,
@@ -3208,7 +3424,55 @@ class parser
     std::istream& input_;
     std::string line_;
     std::size_t line_number_ = 0;
+    Handler* handler_ = nullptr;
 };
+
+/**
+ * The parser class.
+ */
+class parser : protected parser_sax<detail::dom_handler>, private detail::dom_handler
+{
+  public:
+    /**
+     * Parsers are constructed from streams.
+     */
+    parser(std::istream& stream) : parser_sax(stream)
+    {
+        // nothing
+    }
+
+    parser& operator=(const parser& parser) = delete;
+
+    /**
+     * Parses the stream this parser was created on until EOF.
+     * @throw parse_exception if there are errors in parsing
+     */
+    std::shared_ptr<table> parse()
+    {
+        parser_sax::parse(*this);
+        return this->get_root();
+    }
+};
+
+/**
+ * Utility function to parse a file as a TOML file in a SAX-style manner.
+ * Throws a parse_exception if the file cannot be opened.
+ */
+template<class Handler>
+inline void parse_file_sax(const std::string& filename, Handler&& handler)
+{
+#if defined(BOOST_NOWIDE_FSTREAM_INCLUDED_HPP)
+    boost::nowide::ifstream file{filename.c_str()};
+#elif defined(NOWIDE_FSTREAM_INCLUDED_HPP)
+    nowide::ifstream file{filename.c_str()};
+#else
+    std::ifstream file{filename};
+#endif
+    if (!file.is_open())
+        throw parse_exception{filename + " could not be opened for parsing"};
+    parser_sax<Handler> p{file};
+    p.parse(std::forward<Handler>(handler));
+}
 
 /**
  * Utility function to parse a file as a TOML file. Returns the root table.
