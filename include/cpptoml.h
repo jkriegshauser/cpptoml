@@ -4,6 +4,9 @@
  * @date May 2013
  */
 
+// Copyright (c) 2013 - 2018 Chase Geigle
+// Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 #ifndef CPPTOML_H
 #define CPPTOML_H
 
